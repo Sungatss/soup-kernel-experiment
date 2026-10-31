@@ -264,12 +264,16 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
     from collections import defaultdict
     from types import SimpleNamespace
     from peft import LoraConfig, get_peft_model
+    from solution import entropy as vocab_entropy
     from soup_cli.trainer.rewind_hf import attach_rewind_state, make_rewind_trainer_class
     from transformers import Qwen2Config, Qwen2ForCausalLM
     from transformers.loss import loss_utils
     from trl import SFTTrainer
+    from trl.trainer import sft_trainer
 
     original = loss_utils.fixed_cross_entropy
+    original_entropy = sft_trainer.entropy_from_logits
+    monkeypatch.setattr(sft_trainer, "entropy_from_logits", original_entropy)
     ignored_kwargs = []
 
     def native_ce(*args, **kwargs):
@@ -328,14 +332,27 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
         return compute(*args, **kwargs)
 
     monkeypatch.setattr(vocab_ce, "fixed_vocab_cross_entropy", observed)
+    assert vocab_entropy.patch_trl_entropy()
+    entropy_calls = []
+    compute_entropy = vocab_entropy.token_entropy
+
+    def observed_entropy(*args, **kwargs):
+        entropy_calls.append(True)
+        return compute_entropy(*args, **kwargs)
+
+    monkeypatch.setattr(vocab_entropy, "token_entropy", observed_entropy)
     if kernel_device.type == "cpu":
         monkeypatch.setattr(vocab_ce, "_eligible", lambda *args: True)
+        monkeypatch.setattr(vocab_entropy, "_eligible", lambda *args: True)
     actual = run()
-    assert len(calls) == 1
+    assert len(calls) == len(entropy_calls) == 1
     torch.testing.assert_close(actual[0], expected[0], rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=2e-6)
     assert torch.count_nonzero(actual[1]).item() > 0
-    assert actual[2:] == expected[2:]
+    assert actual[2]["entropy"] == pytest.approx(expected[2]["entropy"], rel=5e-5, abs=5e-5)
+    for key in expected[2].keys() - {"entropy"}:
+        assert actual[2][key] == expected[2][key]
+    assert actual[3] == expected[3]
 
 
 @pytest.mark.parametrize("case", ["strided", "target_strided", "dtype", "vocab", "empty", "ignore", "kwargs"])
