@@ -259,11 +259,12 @@ def test_tiny_qwen_model_gradient_path(kernel_device, monkeypatch):
     assert torch.count_nonzero(projection.grad).item() > 0
 
 
-def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch, quantized):
     """Real PEFT/Qwen forward through Soup/TRL's NLL and metric path."""
     from collections import defaultdict
     from types import SimpleNamespace
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from solution import entropy as vocab_entropy
     from soup_cli.trainer.rewind_hf import attach_rewind_state, make_rewind_trainer_class
     from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -283,13 +284,45 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
     monkeypatch.setattr(loss_utils, "fixed_cross_entropy", native_ce)
     torch.manual_seed(53)
     config = Qwen2Config(vocab_size=vocab_ce.VOCAB_SIZE, hidden_size=16,
-                         intermediate_size=32, num_hidden_layers=1,
+                         intermediate_size=32, num_hidden_layers=2 if quantized else 1,
                          num_attention_heads=2, num_key_value_heads=1,
                          tie_word_embeddings=True, attention_dropout=0.0)
-    model = get_peft_model(Qwen2ForCausalLM(config),
-                           LoraConfig(r=2, lora_alpha=4, lora_dropout=0.0,
-                                      target_modules=["q_proj"], task_type="CAUSAL_LM"))
+    base = Qwen2ForCausalLM(config).to(kernel_device)
+    if quantized:
+        import bitsandbytes as bnb
+        from accelerate.utils import convert_outputs_to_fp32
+        from solution import nf4
+
+        for attention, name in ((layer.self_attn, name) for layer in base.model.layers
+                                for name in ("q_proj", "v_proj")):
+            original_linear = getattr(attention, name)
+            linear = bnb.nn.Linear4bit(original_linear.in_features, original_linear.out_features,
+                                      bias=True, compute_dtype=torch.float16,
+                                      compress_statistics=True, quant_type="nf4")
+            linear.weight = bnb.nn.Params4bit(original_linear.weight.detach().half(),
+                                             requires_grad=False, compress_statistics=True,
+                                             quant_type="nf4").to(kernel_device)
+            linear.bias = torch.nn.Parameter(original_linear.bias.detach().half(), requires_grad=False)
+            setattr(attention, name, linear)
+        base.is_loaded_in_4bit = True
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=False)
+    model = get_peft_model(base,
+                           LoraConfig(r=2, lora_alpha=4, lora_dropout=0.05,
+                                      target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"))
     model.to(kernel_device).train()
+    if quantized:
+        model.forward = convert_outputs_to_fp32(
+            torch.autocast(kernel_device.type, dtype=torch.float16)(model.forward))
+        head = model.base_model.model.lm_head
+        assert head.weight is model.base_model.model.model.embed_tokens.weight
+        assert head.weight.dtype == torch.float32 and not head.weight.requires_grad
+        head_calls, head_grads = [], []
+
+        def observe_head(module, args, output):
+            head_calls.append((args[0].dtype, output.dtype))
+            args[0].register_hook(lambda grad: head_grads.append(grad.dtype))
+
+        head.register_forward_hook(observe_head)
     projection = model.base_model.model.model.layers[0].self_attn.q_proj.lora_B["default"].weight
     labels = torch.tensor([[-100, 8, 11]], device=kernel_device)
     inputs = {"input_ids": torch.tensor([[5, 8, 11]], device=kernel_device),
@@ -307,6 +340,7 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
     trainer.state = SimpleNamespace(global_step=0)
 
     def run():
+        torch.manual_seed(121)  # identical dropout masks in the two reference runs
         trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         trainer._total_train_tokens = 0
         records = []
@@ -318,7 +352,8 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
         assert not state.failed and state.dropped == 0
         assert records[0]["rows"] == [17] and records[0]["row_tokens"] == [2]
         assert outputs.logits.shape == (1, 3, vocab_ce.VOCAB_SIZE)
-        return loss.detach(), projection.grad.detach().clone(), dict(trainer._metrics["train"]), records
+        return (loss.detach(), projection.grad.detach().clone(), dict(trainer._metrics["train"]), records,
+                {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.requires_grad})
 
     expected = run()
     assert ignored_kwargs == [{"output_attentions", "output_hidden_states"}]
@@ -344,7 +379,28 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
     if kernel_device.type == "cpu":
         monkeypatch.setattr(vocab_ce, "_eligible", lambda *args: True)
         monkeypatch.setattr(vocab_entropy, "_eligible", lambda *args: True)
+    nf4_calls = []
+    if quantized:
+        monkeypatch.setattr(bnb.functional, "dequantize_4bit", bnb.functional.dequantize_4bit)
+        if kernel_device.type == "cpu":
+            monkeypatch.setattr(nf4, "_on_cuda", lambda tensor: True)
+        else:
+            from bitsandbytes.backends.cuda import ops
+            monkeypatch.setattr(ops, "_dequant_linear_fallback", ops._dequant_linear_fallback)
+        monkeypatch.setattr(nf4, "QWEN_SHAPES", {(16, 16), (8, 16)})
+        compute_nf4 = nf4.dequantize_nested
+
+        def observed_nf4(*args):
+            nf4_calls.append(tuple(args[-1]))
+            return compute_nf4(*args)
+
+        monkeypatch.setattr(nf4, "dequantize_nested", observed_nf4)
+        assert nf4.patch_bitsandbytes_nf4()
     actual = run()
+    if quantized:
+        assert nf4_calls, "quantized PEFT/Qwen backward bypassed original NF4 kernel"
+        assert head_calls == [(torch.float32, torch.float16)] * 2
+        assert head_grads == [torch.float32] * 2
     assert len(calls) == len(entropy_calls) == 1
     torch.testing.assert_close(actual[0], expected[0], rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=2e-6)
@@ -353,6 +409,9 @@ def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
     for key in expected[2].keys() - {"entropy"}:
         assert actual[2][key] == expected[2][key]
     assert actual[3] == expected[3]
+    assert actual[4].keys() == expected[4].keys()
+    for name in actual[4]:
+        torch.testing.assert_close(actual[4][name], expected[4][name], rtol=5e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("case", ["strided", "target_strided", "dtype", "vocab", "empty", "ignore", "kwargs"])

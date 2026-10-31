@@ -17,6 +17,7 @@ Only Kaggle T4 numbers count. The README's ~79–83 s and ~14,350 MiB are organi
 | Not supplied | Not supplied | Not supplied | 79.91 | 83.37 | 14345 | 12385 | 2.04966 | 2.04966 | Not supplied | 8/10; only 3 and 4 failed | User-verified Kaggle T4 starter run; repeats=1; 79 regression tests passed |
 | Not supplied | `3e15f49` | Not supplied | 87.06 | 86.56 | 14345 | 12385 | 2.0497 | 2.0497 | 0 eligible CE launches | Not supplied | User-reported T4 summary; 2 base + 2 solution runs succeeded; 43/43 CUDA solution tests passed; solution metrics contained only excluded starter SwiGLU launches. Per-run values and summary aggregation were not supplied. |
 | Not supplied | `02d49c5` | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | 0.893% | Not supplied | User-verified T4: 44 CUDA tests passed, original CE kernels executed; eligible kernel time 441.138 ms over 49.38 s synchronized training time. Full paired wall, memory, loss and per-run files were not supplied. |
+| Not supplied | `b45a74b` | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | 1.445% | Not supplied | User-verified T4: original kernel time 677.431 ms; timed training 46.885 s. CUDA test count, raw per-run files, repeats, wall/memory/eval and other gates were not supplied. |
 
 Source: the user's Milestone 2 report; raw result/check files have not been inspected locally. The starter uses the shipped SwiGLU example, which earns no own-kernel credit. Derived from this pair: wall time +3.46 s (+4.33%), peak memory −1,960 MiB (−13.66%), speedup 0.9585x, memory ratio 1.1583x, reported loss delta 0%. One repeat does not establish timing variance. Run date, commit, notebook version, and numeric share remain unspecified.
 
@@ -42,6 +43,60 @@ Milestone 4.1 diagnosis: commit `3e15f49` completed two paired T4 runs but launc
 Milestone 4.2 arithmetic from the user-verified `02d49c5` measurement: `441.138 ms / (49.38 s × 1000) = 0.893%`. At that run's denominator, 5% would be 2,469 ms of eligible execution, leaving **2,027.862 ms**. This is a planning difference, not a forecast: the next solution changes both the numerator and the timed-loop denominator. The supplied prior category profile does not isolate entropy, accuracy, or rewind, and no new raw `profile.json` was provided. Do not attribute any specific milliseconds to them.
 
 **Repository facts:** TRL's entropy helper materializes chunked full-vocabulary log-softmax values and reduces them without gradients; accuracy separately copies shifted logits and takes a vocabulary argmax; Soup rewind runs per-row detached CE and transfers row summaries to Python. **Hypotheses:** entropy likely contributes to the previous 6.49% log-softmax and 16.30% elementwise categories, while accuracy may contribute to copies/dtype (18.77%) and reductions. None of those contributions is individually measured. GEMM (39.82%) is the largest measured category, but replacing library matrix multiplication or the LM head would require more difficult gradient and performance validation. The narrow entropy kernel is a correctness-first experiment, not evidence that 5% will pass.
+
+## Milestone 4.3: current Kaggle validation and automatic export
+
+Verified `b45a74b` arithmetic: `677.431 / 46885 × 100 = 1.4449%`, consistent with the reported **1.445%**. At that denominator, 5% is **2,344.250 ms**, leaving **1,666.819 ms**. This is a planning gap, not predicted new performance. The prior profile is not a measurement of the new NF4 fusion. No new CUDA, speed, memory, loss, or eligible-share result has been recorded for Milestone 4.3.
+
+Known-good full SHA: `b45a74b1ce18f5c2baf05e7f86394ebb56a86528`; preserved as `codex/known-good-b45a74b`. Use that SHA in a separate fresh notebook for rollback. Do not overwrite its prior run artifacts.
+
+1. Use the official notebook on **GPU T4 x2**, Internet enabled. Set `REPO_URL = "https://github.com/Sungatss/soup-kernel-experiment.git"` and `COMMIT` to the full Milestone 4.3 SHA reported with delivery. Run its dependency, clone and data-preparation cells. Keep the official package pins and settings. The personal repository is for this experiment; submission still follows the challenge's repository rules.
+2. Replace the notebook's execution of the test/benchmark/check/score cells with this single cell (do not run both sequences). It runs the same official commands, two paired repeats plus the official profile, and a separate diagnostic. It stops before benchmarking if numerical tests fail. It automatically creates a ZIP even if admission fails. No dependencies are installed during these commands.
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working/repo
+unset TRITON_INTERPRET
+git rev-parse HEAD
+CUDA_VISIBLE_DEVICES=0 python solution/validate_kaggle.py --out runs_m43 --diagnose
+```
+
+The expected solution-suite count is **77 tests, zero skips on CUDA**. The numerical suite includes a real bitsandbytes 2,048-row forward fallback and backward, and a two-layer quantized PEFT/Qwen + AMP + Soup/TRL/rewind method-chain test. CPU interpreter results are not a substitute for this CUDA run. If a test or check fails, preserve the ZIP; do not relax tolerances or alter training settings to force a pass.
+
+Underlying commands, all in fresh processes:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest solution -q -p no:cacheprovider
+python harness/run_task.py --repeats 2 --profile --out runs_m43
+python harness/check_rules.py --result runs_m43/result.json
+python harness/score.py runs_m43/result.json
+CUDA_VISIBLE_DEVICES=0 python -m solution.diagnose_projections --out runs_m43/diagnostic
+```
+
+The driver invokes these automatically; the list explains its operation. `check_rules.py` also runs all 79 official regressions with the solution applied. The driver audits positive launches, expected `solution/` file paths and timed execution for all six original kernels in **both** solution runs, including `nested_nf4_dequant_kernel`. `launch_audit.json` prints their sum and share; `checks.json` remains the authority for all admission gates and the minimum share. The starter kernels never count.
+
+`runs_m43/solution_profile/profile.json` is the official kernel table (6 wait + 2 warmup + 16 active steps). The optional `runs_m43/diagnostic/` uses the same official profiling schedule with forward scopes and tensor-shape recording added only in that separate process. It writes:
+
+- `projections.json`: actual model classes, frozen weight/quantization metadata, LoRA dtypes/scaling/dropout, first-call input/output and available gradient dtypes/strides, and AMP state for `lm_head`, `q_proj`, `v_proj`.
+- `trace.json`: Chrome trace with `projection::<module path>` forward scopes, CPU operators and correlated CUDA kernels. Inspect forward `aten::linear`/`aten::mm`, their casts, and autograd `MmBackward`/`MatMul4BitBackward` for input-gradient costs. First-layer q/v may have no input gradient because their upstream base is frozen; later layers must propagate to upstream LoRA.
+- `operators.json`: operator totals grouped by input shapes. Inclusive totals overlap; do not add them together or equate them to eligible time. Shape recording can retain tensors and change memory/timing. These diagnostic artifacts are **not admission measurements**.
+
+If the output directory or ZIP exists, choose a fresh name (for example `--out runs_m43_retry1`). No old artifacts are deleted. For a manual diagnostic only after a successful download/preparation, the last command above is sufficient with a fresh output directory. No profiling package installation is needed.
+
+3. Even if the Bash cell reports a nonzero exit, run this Python cell to download the automatically exported evidence:
+
+```python
+from pathlib import Path
+from IPython.display import FileLink, display
+import os
+archive = Path('/kaggle/working/runs_m43-evidence.zip')
+assert archive.is_file(), 'Inspect the driver log if the process was killed before export'
+os.chdir(archive.parent)
+display(FileLink(archive.name))
+```
+
+The ZIP includes commit/status/package versions, command exit codes, numerical/regression logs, paired result/checks/eval/metrics/configs, required rewind/trainer summaries, raw profiles and CSVs, optional projection diagnostics, submitted source and relevant documentation, plus file hashes. It excludes model/adapter weights, compiler caches, databases, and credentials. A killed process or exhausted disk cannot guarantee export; the run directory remains available in Kaggle output files. Failed checks are preserved and return a nonzero exit.
 
 ## Milestone 4.2: exact Kaggle validation and export
 

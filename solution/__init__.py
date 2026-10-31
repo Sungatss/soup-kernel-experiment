@@ -16,9 +16,11 @@ The rules in short (the README and the task statement have the full ones):
 from .swiglu import patch_qwen2_mlp
 from .vocab_ce import patch_transformers_cross_entropy
 from .entropy import patch_trl_entropy
+from .nf4 import patch_bitsandbytes_nf4
 
 
 def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_transformers_cross_entropy()
     patch_trl_entropy()
+    patch_bitsandbytes_nf4()
