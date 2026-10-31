@@ -18,6 +18,7 @@ Only Kaggle T4 numbers count. The README's ~79–83 s and ~14,350 MiB are organi
 | Not supplied | `3e15f49` | Not supplied | 87.06 | 86.56 | 14345 | 12385 | 2.0497 | 2.0497 | 0 eligible CE launches | Not supplied | User-reported T4 summary; 2 base + 2 solution runs succeeded; 43/43 CUDA solution tests passed; solution metrics contained only excluded starter SwiGLU launches. Per-run values and summary aggregation were not supplied. |
 | Not supplied | `02d49c5` | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | 0.893% | Not supplied | User-verified T4: 44 CUDA tests passed, original CE kernels executed; eligible kernel time 441.138 ms over 49.38 s synchronized training time. Full paired wall, memory, loss and per-run files were not supplied. |
 | Not supplied | `b45a74b` | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | Not supplied | 1.445% | Not supplied | User-verified T4: original kernel time 677.431 ms; timed training 46.885 s. CUDA test count, raw per-run files, repeats, wall/memory/eval and other gates were not supplied. |
+| Not supplied | `ed35c4b` | Not supplied | 89.8 | 86.5 | Not supplied | Not supplied | Not supplied | Not supplied | 7.34% | 10/10 PASS | User-verified Kaggle T4. Reported speedup 1.038x and memory ratio 1.158x. Raw per-run artifacts, repeat count, absolute memory/eval and notebook version were not supplied. |
 
 Source: the user's Milestone 2 report; raw result/check files have not been inspected locally. The starter uses the shipped SwiGLU example, which earns no own-kernel credit. Derived from this pair: wall time +3.46 s (+4.33%), peak memory −1,960 MiB (−13.66%), speedup 0.9585x, memory ratio 1.1583x, reported loss delta 0%. One repeat does not establish timing variance. Run date, commit, notebook version, and numeric share remain unspecified.
 
@@ -44,9 +45,65 @@ Milestone 4.2 arithmetic from the user-verified `02d49c5` measurement: `441.138 
 
 **Repository facts:** TRL's entropy helper materializes chunked full-vocabulary log-softmax values and reduces them without gradients; accuracy separately copies shifted logits and takes a vocabulary argmax; Soup rewind runs per-row detached CE and transfers row summaries to Python. **Hypotheses:** entropy likely contributes to the previous 6.49% log-softmax and 16.30% elementwise categories, while accuracy may contribute to copies/dtype (18.77%) and reductions. None of those contributions is individually measured. GEMM (39.82%) is the largest measured category, but replacing library matrix multiplication or the LM head would require more difficult gradient and performance validation. The narrow entropy kernel is a correctness-first experiment, not evidence that 5% will pass.
 
+## Milestone 4.4: speed experiment and rollback
+
+Known-good: **`ed35c4b947a0076445ad4ed164b1d55caaf3b729`**, all 10 admission checks passed on the user-verified T4 run, eligible share **7.34%**, base **89.8 s**, solution **86.5 s**, speedup **1.038x**, memory ratio **1.158x**. The rounded times imply 1.03815x. Speedup below 1.05x counts as a tie under the official scoring rule.
+
+At an unchanged 89.8 s base, 1.05x requires at most **85.524 s** solution wall time (about **0.976 s** saved from 86.5 s); 1.08x requires **83.148 s** (about **3.352 s** saved). These are target calculations, not results. The experiment changes only the NF4 constant lookup to a balanced bit-selection tree; current launch configuration, compilation specialization and starter SwiGLU remain as measured. See `SPEED_EXPERIMENT.md` for offline compiler evidence and test results. No new T4 performance claim is made.
+
+### Exact Kaggle cells
+
+Use a fresh notebook/session on **GPU T4 x2**, Internet enabled, with both GPUs idle. Import the official template. Set its first code cell to:
+
+```python
+REPO_URL = "https://github.com/Sungatss/soup-kernel-experiment.git"
+COMMIT = "SET_TO_THE_FULL_M44_SHA_REPORTED_WITH_DELIVERY"
+```
+
+Run the official dependency and clone cells, then data preparation. Use these cells in place of the template's separate test/benchmark/check/score cells. No package installation happens during measurements.
+
+```bash
+%%bash
+set -euo pipefail
+cd /kaggle/working/repo
+unset TRITON_INTERPRET
+python task/prepare_data.py
+git rev-parse HEAD
+CUDA_VISIBLE_DEVICES=0 python solution/validate_kaggle.py --out runs_m44 --speed-gate
+```
+
+The expected CUDA suite is **89 tests with zero skips** (including 12 CPU-only validation-policy tests). The driver runs the complete solution suite, **two paired official repeats** in order base/solution/solution/base, `harness/check_rules.py` with all 10 checks and the 79 official regressions, then `harness/score.py`. Speed mode adds no profile or diagnostic training run. It checks exact result/source hashes, both repeats' original-kernel launches and the minimum eligible share. It records the actual NF4 compiler-cache metadata count after training exits; no compiler caches are reused or exported.
+
+Acceptance requires all ten checks, speedup **>=1.05x**, memory ratio **>=1.158x**, and minimum eligible share **>=5%**. The preferred 1.08x target is reported separately. This deliberately restores the known-good version even for a small speed improvement that misses 1.05x. Historical ratios are a screening reference, not a new same-session rerun of `ed35c4b`; treat small changes as noisy. Do not promote a slower or failed run.
+
+On failure, the driver first writes `/kaggle/working/runs_m44-evidence.zip` containing the **candidate** source, commit, checks and logs. It then switches only the clean Kaggle checkout to detached `ed35c4b` and appends `rollback.json` to the ZIP. It never changes a GitHub branch. If HEAD or tracked files changed during validation, it refuses to overwrite them and records manual rollback instructions. A killed process or full disk may prevent automatic export/rollback; inspect the retained run directory in that case.
+
+Run this Python cell even if validation exits nonzero:
+
+```python
+import os
+from pathlib import Path
+from IPython.display import FileLink, display
+archive = Path('/kaggle/working/runs_m44-evidence.zip')
+assert archive.is_file(), 'Inspect the validation log and retained run directory'
+os.chdir(archive.parent)
+display(FileLink(archive.name))
+```
+
+Inspect `speed_decision.json`, `launch_audit.json`, `nf4_cache_audit.json`, `checks.json`, `result.json` and, after failure, `rollback.json`. Raw absolute timings, memory and losses remain in official artifacts. Do not rename the previous run's results as this experiment's evidence. Keep the ZIP even on rejection. Choose a fresh `--out` name for every rerun.
+
+Manual rollback, only in a clean checkout after saving evidence:
+
+```bash
+cd /kaggle/working/repo
+git checkout --detach ed35c4b947a0076445ad4ed164b1d55caaf3b729
+```
+
+No Milestone 4.4 Kaggle run has been executed locally. The published experimental branch must not replace the admitted implementation until this gate passes.
+
 ## Milestone 4.3: current Kaggle validation and automatic export
 
-Verified `b45a74b` arithmetic: `677.431 / 46885 × 100 = 1.4449%`, consistent with the reported **1.445%**. At that denominator, 5% is **2,344.250 ms**, leaving **1,666.819 ms**. This is a planning gap, not predicted new performance. The prior profile is not a measurement of the new NF4 fusion. No new CUDA, speed, memory, loss, or eligible-share result has been recorded for Milestone 4.3.
+Verified `b45a74b` arithmetic: `677.431 / 46885 × 100 = 1.4449%`, consistent with the reported **1.445%**. At that denominator, 5% is **2,344.250 ms**, leaving **1,666.819 ms**. This is a planning gap, not predicted new performance. The prior profile is not a measurement of the new NF4 fusion. The later user-verified `ed35c4b` result is recorded above; the remainder of this section preserves the original M4.3 procedure.
 
 Known-good full SHA: `b45a74b1ce18f5c2baf05e7f86394ebb56a86528`; preserved as `codex/known-good-b45a74b`. Use that SHA in a separate fresh notebook for rollback. Do not overwrite its prior run artifacts.
 

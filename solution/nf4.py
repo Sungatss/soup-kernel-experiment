@@ -38,9 +38,25 @@ def nested_nf4_dequant_kernel(PACKED, SCALES8, SCALE_MAX, SCALE_CODE, OFFSET, OU
                            0.24611230194568634, 0.33791524171829224,
                            0.44070982933044434, 0.5626170039176941,
                            0.7229568362236023, 1.0)
-    value = tl.full((BLOCK,), 0.0, tl.float32)
-    for k in tl.static_range(16):
-        value = tl.where(code == k, levels[k], value)
+    # Select adjacent pairs, then groups of 4/8/16: four dependent stages.
+    # The constants and the subsequent fp32 multiplication are unchanged.
+    b0 = (code & 1) != 0
+    b1 = (code & 2) != 0
+    b2 = (code & 4) != 0
+    b3 = (code & 8) != 0
+    p0 = tl.where(b0, levels[1], levels[0])
+    p1 = tl.where(b0, levels[3], levels[2])
+    p2 = tl.where(b0, levels[5], levels[4])
+    p3 = tl.where(b0, levels[7], levels[6])
+    p4 = tl.where(b0, levels[9], levels[8])
+    p5 = tl.where(b0, levels[11], levels[10])
+    p6 = tl.where(b0, levels[13], levels[12])
+    p7 = tl.where(b0, levels[15], levels[14])
+    q0 = tl.where(b1, p1, p0)
+    q1 = tl.where(b1, p3, p2)
+    q2 = tl.where(b1, p5, p4)
+    q3 = tl.where(b1, p7, p6)
+    value = tl.where(b3, tl.where(b2, q3, q2), tl.where(b2, q1, q0))
     tl.store(OUT + i, value * scale, valid)
 
 
