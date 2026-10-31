@@ -259,6 +259,85 @@ def test_tiny_qwen_model_gradient_path(kernel_device, monkeypatch):
     assert torch.count_nonzero(projection.grad).item() > 0
 
 
+def test_peft_rewind_nll_reaches_vocab_ce(kernel_device, monkeypatch):
+    """Real PEFT/Qwen forward through Soup/TRL's NLL and metric path."""
+    from collections import defaultdict
+    from types import SimpleNamespace
+    from peft import LoraConfig, get_peft_model
+    from soup_cli.trainer.rewind_hf import attach_rewind_state, make_rewind_trainer_class
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    from transformers.loss import loss_utils
+    from trl import SFTTrainer
+
+    original = loss_utils.fixed_cross_entropy
+    ignored_kwargs = []
+
+    def native_ce(*args, **kwargs):
+        ignored_kwargs.append(set(kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loss_utils, "fixed_cross_entropy", native_ce)
+    torch.manual_seed(53)
+    config = Qwen2Config(vocab_size=vocab_ce.VOCAB_SIZE, hidden_size=16,
+                         intermediate_size=32, num_hidden_layers=1,
+                         num_attention_heads=2, num_key_value_heads=1,
+                         tie_word_embeddings=True, attention_dropout=0.0)
+    model = get_peft_model(Qwen2ForCausalLM(config),
+                           LoraConfig(r=2, lora_alpha=4, lora_dropout=0.0,
+                                      target_modules=["q_proj"], task_type="CAUSAL_LM"))
+    model.to(kernel_device).train()
+    projection = model.base_model.model.model.layers[0].self_attn.q_proj.lora_B["default"].weight
+    labels = torch.tensor([[-100, 8, 11]], device=kernel_device)
+    inputs = {"input_ids": torch.tensor([[5, 8, 11]], device=kernel_device),
+              "attention_mask": torch.ones((1, 3), device=kernel_device),
+              "labels": labels}
+    trainer = object.__new__(make_rewind_trainer_class(SFTTrainer))
+    trainer.model = model
+    trainer.args = SimpleNamespace(use_liger_kernel=False, average_tokens_across_devices=False,
+                                   loss_type="nll")
+    trainer.accelerator = SimpleNamespace(parallelism_config=None, gather_for_metrics=lambda x: x)
+    trainer.label_smoother = trainer.compute_loss_func = None
+    trainer.model_accepts_loss_kwargs = True
+    trainer.num_virtual_tokens = 0
+    trainer.aux_loss_enabled = False
+    trainer.state = SimpleNamespace(global_step=0)
+
+    def run():
+        trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        trainer._total_train_tokens = 0
+        records = []
+        state = attach_rewind_state(trainer, SimpleNamespace(record_batch=lambda **kw: records.append(kw)))
+        state.on_index(17)
+        loss, outputs = trainer.compute_loss(model, dict(inputs), return_outputs=True,
+                                             num_items_in_batch=2)
+        loss.backward()
+        assert not state.failed and state.dropped == 0
+        assert records[0]["rows"] == [17] and records[0]["row_tokens"] == [2]
+        assert outputs.logits.shape == (1, 3, vocab_ce.VOCAB_SIZE)
+        return loss.detach(), projection.grad.detach().clone(), dict(trainer._metrics["train"]), records
+
+    expected = run()
+    assert ignored_kwargs == [{"output_attentions", "output_hidden_states"}]
+    model.zero_grad(set_to_none=True)
+    assert vocab_ce.patch_transformers_cross_entropy()
+    calls = []
+    compute = vocab_ce.fixed_vocab_cross_entropy
+
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return compute(*args, **kwargs)
+
+    monkeypatch.setattr(vocab_ce, "fixed_vocab_cross_entropy", observed)
+    if kernel_device.type == "cpu":
+        monkeypatch.setattr(vocab_ce, "_eligible", lambda *args: True)
+    actual = run()
+    assert len(calls) == 1
+    torch.testing.assert_close(actual[0], expected[0], rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(actual[1], expected[1], rtol=5e-5, atol=2e-6)
+    assert torch.count_nonzero(actual[1]).item() > 0
+    assert actual[2:] == expected[2:]
+
+
 @pytest.mark.parametrize("case", ["strided", "target_strided", "dtype", "vocab", "empty", "ignore", "kwargs"])
 def test_unsupported_inputs_fall_back(kernel_device, monkeypatch, case):
     from transformers.loss import loss_utils

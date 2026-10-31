@@ -17,6 +17,7 @@ import triton.language as tl
 
 VOCAB_SIZE = 151936
 TILE = 2048
+_IGNORED_MODEL_OUTPUT_KWARGS = frozenset({"output_attentions", "output_hidden_states"})
 
 
 @triton.jit
@@ -159,7 +160,9 @@ def patch_transformers_cross_entropy():
 
     @wraps(original)
     def fixed_cross_entropy(source, target, num_items_in_batch=None, ignore_index=-100, **kwargs):
-        if not kwargs and _eligible(source, target, ignore_index):
+        # PEFT forwards these Qwen2 model-output flags to ForCausalLMLoss;
+        # Transformers' fixed_cross_entropy ignores them as well.
+        if kwargs.keys() <= _IGNORED_MODEL_OUTPUT_KWARGS and _eligible(source, target, ignore_index):
             return fixed_vocab_cross_entropy(source, target, num_items_in_batch, ignore_index)
         return original(source, target, num_items_in_batch, ignore_index, **kwargs)
 

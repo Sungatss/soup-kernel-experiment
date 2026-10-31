@@ -15,6 +15,7 @@ Only Kaggle T4 numbers count. The README's ~79–83 s and ~14,350 MiB are organi
 | Date | Commit | Kaggle notebook/version | Base wall s | Solution wall s | Base peak MiB | Solution peak MiB | Base eval loss | Solution eval loss | Own kernel share | Checks | Notes |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|
 | Not supplied | Not supplied | Not supplied | 79.91 | 83.37 | 14345 | 12385 | 2.04966 | 2.04966 | Not supplied | 8/10; only 3 and 4 failed | User-verified Kaggle T4 starter run; repeats=1; 79 regression tests passed |
+| Not supplied | `3e15f49` | Not supplied | 87.06 | 86.56 | 14345 | 12385 | 2.0497 | 2.0497 | 0 eligible CE launches | Not supplied | User-reported T4 summary; 2 base + 2 solution runs succeeded; 43/43 CUDA solution tests passed; solution metrics contained only excluded starter SwiGLU launches. Per-run values and summary aggregation were not supplied. |
 
 Source: the user's Milestone 2 report; raw result/check files have not been inspected locally. The starter uses the shipped SwiGLU example, which earns no own-kernel credit. Derived from this pair: wall time +3.46 s (+4.33%), peak memory −1,960 MiB (−13.66%), speedup 0.9585x, memory ratio 1.1583x, reported loss delta 0%. One repeat does not establish timing variance. Run date, commit, notebook version, and numeric share remain unspecified.
 
@@ -33,7 +34,9 @@ User-reported real T4 profile; raw per-kernel JSON, date, commit, and notebook v
 
 The listed categories total 91.67%; the remaining 8.33% was not categorized in the supplied report. Prior full-run synchronized steps 3+ totaled **50.566 s**, giving a reference 5% threshold of **2.5283 s**. The optimized run has its own denominator. The 6.49% category spans operations potentially used by training loss, entropy, and rewind; it is not an eligible-kernel measurement for the new CE implementation.
 
-Milestone 3 introduces original training CE kernels but has **no new T4 benchmark result yet**. See `LOSS_PATH.md` for exact validation instructions. Local interpreter tests and offline SM75 compilation are verification results, not performance measurements.
+At the Milestone 3 commit, the original training CE kernels had **no T4 benchmark result**. The later `3e15f49` run above confirms they were not invoked. See `LOSS_PATH.md` for validation instructions. Local interpreter tests and offline SM75 compilation are verification results, not performance measurements.
+
+Milestone 4.1 diagnosis: commit `3e15f49` completed two paired T4 runs but launched none of the original CE kernels in training. The published timing and loss therefore describe the starter path plus an inert CE patch, not CE performance. Local PEFT/Qwen2 tracing showed that the model forwards `output_attentions` and `output_hidden_states` to `fixed_cross_entropy`; the previous wrapper rejected all keyword arguments even though Transformers ignores these two. A narrow guard correction is committed separately. Its T4 timing, memory, loss, and admission share remain unmeasured.
 
 ## Milestone 2: exact Kaggle profiling and export
 
